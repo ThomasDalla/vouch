@@ -324,91 +324,85 @@ func parseAndCheckParameters(ctx context.Context, params ...Parameter) (*paramet
 		p.apply(&parameters)
 	}
 
-	if parameters.monitor == nil {
-		return nil, errors.New("no monitor specified")
+	if err := parameters.validate(); err != nil {
+		return nil, err
 	}
-	if parameters.specProvider == nil {
-		return nil, errors.New("no spec provider specified")
-	}
-	if parameters.chainTimeService == nil {
-		return nil, errors.New("no chain time service specified")
-	}
-	if parameters.proposerDutiesProvider == nil {
-		return nil, errors.New("no proposer duties provider specified")
-	}
-	if parameters.attesterDutiesProvider == nil {
-		return nil, errors.New("no attester duties provider specified")
-	}
-	if parameters.eventsProvider == nil {
-		return nil, errors.New("no events provider specified")
-	}
-	if parameters.validatingAccountsProvider == nil {
-		return nil, errors.New("no validating accounts provider specified")
-	}
-	if parameters.proposalsPreparer == nil {
-		return nil, errors.New("no proposals preparer specified")
-	}
-	if parameters.scheduler == nil {
-		return nil, errors.New("no scheduler service specified")
-	}
-	if parameters.attester == nil {
-		return nil, errors.New("no attester specified")
-	}
-	if parameters.beaconBlockProposer == nil {
-		return nil, errors.New("no beacon block proposer specified")
-	}
-	if parameters.beaconBlockHeadersProvider == nil {
-		return nil, errors.New("no beacon block headers provider specified")
-	}
-	if parameters.signedBeaconBlockProvider == nil {
-		return nil, errors.New("no signed beacon block provider specified")
-	}
-	if parameters.attestationAggregator == nil {
-		return nil, errors.New("no attestation aggregator specified")
-	}
-	if parameters.beaconCommitteeSubscriber == nil {
-		return nil, errors.New("no beacon committee subscriber specified")
-	}
-	if parameters.accountsRefresher == nil {
-		return nil, errors.New("no accounts refresher specified")
-	}
-	if parameters.blockToSlotSetter == nil {
-		return nil, errors.New("no block to slot setter specified")
-	}
-	if parameters.multiInstance == nil {
-		return nil, errors.New("no multi instance service specified")
-	}
-	specResponse, err := parameters.specProvider.Spec(ctx, &api.SpecOpts{})
+	spec, slotDuration, err := parameters.slotDuration(ctx)
 	if err != nil {
-		return nil, errors.Wrap(err, "failed to obtain spec")
-	}
-	spec := specResponse.Data
-	tmp, exists := spec["SECONDS_PER_SLOT"]
-	if !exists {
-		return nil, errors.New("SECONDS_PER_SLOT not found in spec")
-	}
-	slotDuration, ok := tmp.(time.Duration)
-	if !ok {
-		return nil, errors.New("SECONDS_PER_SLOT of unexpected type")
+		return nil, err
 	}
 	// maxProposalDelay can be 0, so no check for it here.
 	gloasActive := parameters.chainTimeService.CurrentEpoch() >= parameters.chainTimeService.HardForkEpoch(ctx, "GLOAS_FORK_EPOCH")
-	attestationDue, aggregationDue, syncMessageDue, contributionDue := obtainAttestationTimings(spec, slotDuration, gloasActive)
-	if parameters.maxAttestationDelay == 0 {
-		parameters.maxAttestationDelay = attestationDue
-	}
-	if parameters.attestationAggregationDelay == 0 {
-		parameters.attestationAggregationDelay = aggregationDue
-	}
-	if parameters.maxSyncCommitteeMessageDelay == 0 {
-		parameters.maxSyncCommitteeMessageDelay = syncMessageDue
-	}
-	if parameters.syncCommitteeAggregationDelay == 0 {
-		parameters.syncCommitteeAggregationDelay = contributionDue
-	}
+	parameters.setDefaultDelays(spec, slotDuration, gloasActive)
 	// Sync committee duties provider/messenger/aggregator/subscriber are optional so no checks here.
 
 	return &parameters, nil
+}
+
+func (p *parameters) validate() error {
+	checks := []struct {
+		valid bool
+		err   string
+	}{
+		{p.monitor != nil, "no monitor specified"},
+		{p.specProvider != nil, "no spec provider specified"},
+		{p.chainTimeService != nil, "no chain time service specified"},
+		{p.proposerDutiesProvider != nil, "no proposer duties provider specified"},
+		{p.attesterDutiesProvider != nil, "no attester duties provider specified"},
+		{p.eventsProvider != nil, "no events provider specified"},
+		{p.validatingAccountsProvider != nil, "no validating accounts provider specified"},
+		{p.proposalsPreparer != nil, "no proposals preparer specified"},
+		{p.scheduler != nil, "no scheduler service specified"},
+		{p.attester != nil, "no attester specified"},
+		{p.beaconBlockProposer != nil, "no beacon block proposer specified"},
+		{p.beaconBlockHeadersProvider != nil, "no beacon block headers provider specified"},
+		{p.signedBeaconBlockProvider != nil, "no signed beacon block provider specified"},
+		{p.attestationAggregator != nil, "no attestation aggregator specified"},
+		{p.beaconCommitteeSubscriber != nil, "no beacon committee subscriber specified"},
+		{p.accountsRefresher != nil, "no accounts refresher specified"},
+		{p.blockToSlotSetter != nil, "no block to slot setter specified"},
+		{p.multiInstance != nil, "no multi instance service specified"},
+	}
+	for _, check := range checks {
+		if !check.valid {
+			return errors.New(check.err)
+		}
+	}
+
+	return nil
+}
+
+func (p *parameters) slotDuration(ctx context.Context) (map[string]any, time.Duration, error) {
+	specResponse, err := p.specProvider.Spec(ctx, &api.SpecOpts{})
+	if err != nil {
+		return nil, 0, errors.Wrap(err, "failed to obtain spec")
+	}
+	secondsPerSlot, exists := specResponse.Data["SECONDS_PER_SLOT"]
+	if !exists {
+		return nil, 0, errors.New("SECONDS_PER_SLOT not found in spec")
+	}
+	slotDuration, ok := secondsPerSlot.(time.Duration)
+	if !ok {
+		return nil, 0, errors.New("SECONDS_PER_SLOT of unexpected type")
+	}
+
+	return specResponse.Data, slotDuration, nil
+}
+
+func (p *parameters) setDefaultDelays(spec map[string]any, slotDuration time.Duration, gloasActive bool) {
+	attestationDue, aggregationDue, syncMessageDue, contributionDue := obtainAttestationTimings(spec, slotDuration, gloasActive)
+	if p.maxAttestationDelay == 0 {
+		p.maxAttestationDelay = attestationDue
+	}
+	if p.attestationAggregationDelay == 0 {
+		p.attestationAggregationDelay = aggregationDue
+	}
+	if p.maxSyncCommitteeMessageDelay == 0 {
+		p.maxSyncCommitteeMessageDelay = syncMessageDue
+	}
+	if p.syncCommitteeAggregationDelay == 0 {
+		p.syncCommitteeAggregationDelay = contributionDue
+	}
 }
 
 func obtainAttestationTimings(spec map[string]any, slotDuration time.Duration, gloasActive bool) (time.Duration, time.Duration, time.Duration, time.Duration) {
@@ -441,5 +435,6 @@ func obtainAttestationTimings(spec map[string]any, slotDuration time.Duration, g
 	if bps, ok := dueBPS("CONTRIBUTION_DUE_BPS"); ok {
 		contributionDue = slotDuration * time.Duration(bps) / 10000
 	}
+
 	return attestationDue, aggregationDue, syncMessageDue, contributionDue
 }
