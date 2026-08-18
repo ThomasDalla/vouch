@@ -148,11 +148,12 @@ func domainType(spec map[string]interface{}, input string) (phase0.DomainType, e
 	return domainType, nil
 }
 
+// optionalDomainType returns the domain type if present in the spec, otherwise nil.
 func optionalDomainType(spec map[string]interface{}, input string) *phase0.DomainType {
-	domainType, err := domainType(spec, input)
+	tmp, err := domainType(spec, input)
 	if err != nil {
 		return nil
 	}
 
-	return &domainType
+	return &tmp
 }

@@ -37,10 +37,21 @@ import (
 	"github.com/attestantio/vouch/strategies/beaconblockproposal/best"
 	"github.com/rs/zerolog"
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/otel"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 )
 
 func TestEPBSProposal(t *testing.T) {
 	ctx := context.Background()
+	spanRecorder := tracetest.NewSpanRecorder()
+	tracerProvider := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(spanRecorder))
+	previousTracerProvider := otel.GetTracerProvider()
+	otel.SetTracerProvider(tracerProvider)
+	t.Cleanup(func() {
+		otel.SetTracerProvider(previousTracerProvider)
+		require.NoError(t, tracerProvider.Shutdown(ctx))
+	})
 	specProvider := mock.NewSpecProvider()
 	chainTime, err := standardchaintime.New(ctx,
 		standardchaintime.WithLogLevel(zerolog.Disabled),
@@ -58,6 +69,7 @@ func TestEPBSProposal(t *testing.T) {
 		best.WithSpecProvider(specProvider),
 		best.WithProposalProviders(map[string]beaconblockproposer.ProposalDataProvider{
 			"one": &testEPBSProposalProvider{proposal: testGloasProposal(1, bellatrix.ExecutionAddress{0x01})},
+			"two": &testEPBSProposalProvider{proposal: testGloasProposal(1, bellatrix.ExecutionAddress{0x02})},
 		}),
 		best.WithTimeout(time.Second),
 		best.WithBlockRootToSlotCache(cacheSvc.(cache.BlockRootToSlotProvider)),
@@ -70,6 +82,27 @@ func TestEPBSProposal(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, response)
 	require.NotNil(t, response.Data)
+
+	var epbsProposalSpan sdktrace.ReadOnlySpan
+	providerSpans := make(map[string]sdktrace.ReadOnlySpan)
+	for _, span := range spanRecorder.Ended() {
+		switch span.Name() {
+		case "EPBSProposal":
+			epbsProposalSpan = span
+		case "ePBSBeaconBlockProposal":
+			for _, attribute := range span.Attributes() {
+				if string(attribute.Key) == "provider" {
+					providerSpans[attribute.Value.AsString()] = span
+				}
+			}
+		}
+	}
+	require.NotNil(t, epbsProposalSpan)
+	for _, provider := range []string{"one", "two"} {
+		span, exists := providerSpans[provider]
+		require.True(t, exists, "provider %q should create a span", provider)
+		require.Equal(t, epbsProposalSpan.SpanContext(), span.Parent())
+	}
 }
 
 func TestEPBSProposalReturnsIncludedCandidateAtSoftTimeout(t *testing.T) {
@@ -208,6 +241,78 @@ func TestEPBSProposalRejectsZeroFeeRecipientWithoutPayload(t *testing.T) {
 	response, err := service.EPBSProposal(ctx, &api.EPBSProposalOpts{})
 	require.NoError(t, err)
 	require.Same(t, validCandidate, response.Data)
+}
+
+func TestEPBSProposalDoesNotWeightExecutionPayloadGas(t *testing.T) {
+	ctx := context.Background()
+	specProvider := mock.NewSpecProvider()
+	chainTime, err := standardchaintime.New(ctx,
+		standardchaintime.WithLogLevel(zerolog.Disabled),
+		standardchaintime.WithGenesisProvider(mock.NewGenesisProvider(time.Now())),
+		standardchaintime.WithSpecProvider(specProvider),
+	)
+	require.NoError(t, err)
+	cacheSvc := mockcache.New(map[phase0.Root]phase0.Slot{})
+	consensusCandidate := testGloasProposal(2, bellatrix.ExecutionAddress{0x01})
+	executionCandidate := testGloasProposal(0, bellatrix.ExecutionAddress{0x02})
+	executionCandidate.ConsensusValue = nil
+	executionCandidate.GloasContents.ExecutionPayloadEnvelope = &gloas.ExecutionPayloadEnvelope{
+		Payload: &gloas.ExecutionPayload{GasUsed: 3},
+	}
+	service, err := best.New(ctx,
+		best.WithLogLevel(zerolog.WarnLevel),
+		best.WithClientMonitor(nullmetrics.New()),
+		best.WithProcessConcurrency(2),
+		best.WithChainTimeService(chainTime),
+		best.WithSpecProvider(specProvider),
+		best.WithProposalProviders(map[string]beaconblockproposer.ProposalDataProvider{
+			"consensus": &testEPBSProposalProvider{proposal: consensusCandidate},
+			"execution": &testEPBSProposalProvider{proposal: executionCandidate},
+		}),
+		best.WithTimeout(time.Second),
+		best.WithBlockRootToSlotCache(cacheSvc.(cache.BlockRootToSlotProvider)),
+		best.WithExecutionPayloadFactor(1),
+	)
+	require.NoError(t, err)
+
+	response, err := service.EPBSProposal(ctx, &api.EPBSProposalOpts{})
+	require.NoError(t, err)
+	require.Same(t, consensusCandidate, response.Data)
+}
+
+func TestEPBSProposalComparesLargeValuesExactly(t *testing.T) {
+	ctx := context.Background()
+	specProvider := mock.NewSpecProvider()
+	chainTime, err := standardchaintime.New(ctx,
+		standardchaintime.WithLogLevel(zerolog.Disabled),
+		standardchaintime.WithGenesisProvider(mock.NewGenesisProvider(time.Now())),
+		standardchaintime.WithSpecProvider(specProvider),
+	)
+	require.NoError(t, err)
+	cacheSvc := mockcache.New(map[phase0.Root]phase0.Slot{})
+	base := new(big.Int).Lsh(big.NewInt(1), 54)
+	lowerValueCandidate := testGloasProposal(0, bellatrix.ExecutionAddress{0x01})
+	lowerValueCandidate.ConsensusValue = new(big.Int).Add(base, big.NewInt(1))
+	higherValueCandidate := testGloasProposal(0, bellatrix.ExecutionAddress{0x02})
+	higherValueCandidate.ConsensusValue = new(big.Int).Add(base, big.NewInt(2))
+	service, err := best.New(ctx,
+		best.WithLogLevel(zerolog.Disabled),
+		best.WithClientMonitor(nullmetrics.New()),
+		best.WithProcessConcurrency(2),
+		best.WithChainTimeService(chainTime),
+		best.WithSpecProvider(specProvider),
+		best.WithProposalProviders(map[string]beaconblockproposer.ProposalDataProvider{
+			"lower":  &testEPBSProposalProvider{proposal: lowerValueCandidate},
+			"higher": &testEPBSProposalProvider{proposal: higherValueCandidate, delay: 10 * time.Millisecond},
+		}),
+		best.WithTimeout(time.Second),
+		best.WithBlockRootToSlotCache(cacheSvc.(cache.BlockRootToSlotProvider)),
+	)
+	require.NoError(t, err)
+
+	response, err := service.EPBSProposal(ctx, &api.EPBSProposalOpts{})
+	require.NoError(t, err)
+	require.Same(t, higherValueCandidate, response.Data)
 }
 
 func TestEPBSProposalRejectsNilData(t *testing.T) {
@@ -535,6 +640,7 @@ func TestEPBSProposalStartsProvidersWhileGraffitiClientLookupIsSlow(t *testing.T
 type testEPBSProposalProvider struct {
 	proposal            *api.VersionedEPBSProposal
 	err                 error
+	delay               time.Duration
 	waitForCancellation bool
 }
 
@@ -544,11 +650,12 @@ type clientGraffitiEPBSProposalProvider struct {
 	graffiti      chan [32]byte
 }
 
-func (*clientGraffitiEPBSProposalProvider) Proposal(
-	_ context.Context,
-	_ *api.ProposalOpts,
+func (p *clientGraffitiEPBSProposalProvider) Proposal(ctx context.Context,
+	opts *api.ProposalOpts,
 ) (*api.Response[*api.VersionedProposal], error) {
-	return nil, nil
+	p.graffiti <- opts.Graffiti
+
+	return mock.NewProposalProvider().Proposal(ctx, opts)
 }
 
 func (p *clientGraffitiEPBSProposalProvider) EPBSProposal(
@@ -642,7 +749,7 @@ func (p *waitingClientGraffitiEPBSProposalProvider) NodeClient(
 
 var _ eth2client.NodeClientProvider = (*waitingClientGraffitiEPBSProposalProvider)(nil)
 
-func (p *testEPBSProposalProvider) Proposal(_ context.Context, _ *api.ProposalOpts) (*api.Response[*api.VersionedProposal], error) {
+func (*testEPBSProposalProvider) Proposal(_ context.Context, _ *api.ProposalOpts) (*api.Response[*api.VersionedProposal], error) {
 	return nil, nil
 }
 
@@ -652,6 +759,9 @@ func (p *testEPBSProposalProvider) EPBSProposal(ctx context.Context,
 	*api.Response[*api.VersionedEPBSProposal],
 	error,
 ) {
+	if p.delay != 0 {
+		time.Sleep(p.delay)
+	}
 	if p.waitForCancellation {
 		<-ctx.Done()
 		return nil, ctx.Err()

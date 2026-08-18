@@ -18,6 +18,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"strings"
 	"time"
 
@@ -183,27 +184,10 @@ func (s *Service) proposeBlock(ctx context.Context,
 	}
 
 	if signedProposal.Blinded {
-		// Select the relays to unblind the proposal.
-		providers := make([]builderclient.UnblindedProposalProvider, 0, len(auctionResults.AllProviders))
-		unblindingCandidates := auctionResults.Providers
-		if len(unblindingCandidates) == 0 || s.unblindFromAllRelays {
-			s.log.Trace().Int("providers", len(auctionResults.AllProviders)).Msg("Unblinding from all providers")
-			unblindingCandidates = auctionResults.AllProviders
+		providers, err := s.unblindingProviders(auctionResults)
+		if err != nil {
+			return err
 		}
-
-		for _, provider := range unblindingCandidates {
-			unblindedProposalProvider, isProvider := provider.(builderclient.UnblindedProposalProvider)
-			if !isProvider {
-				s.log.Warn().Str("provider", provider.Name()).Msg("Auctioneer cannot unblind the proposal")
-				continue
-			}
-			providers = append(providers, unblindedProposalProvider)
-		}
-		if len(providers) == 0 {
-			return errors.New("no relays to unblind the block")
-		}
-
-		s.log.Trace().Int("providers", len(providers)).Msg("Obtained relays that can unblind the proposal")
 		if err := s.unblindProposal(ctx, signedProposal, providers); err != nil {
 			return errors.Wrap(err, "failed to unblind block")
 		}
@@ -216,7 +200,36 @@ func (s *Service) proposeBlock(ctx context.Context,
 	return nil
 }
 
+// unblindingProviders returns the relays that can unblind a proposal.
+func (s *Service) unblindingProviders(auctionResults *blockauctioneer.Results) ([]builderclient.UnblindedProposalProvider, error) {
+	// Select the relays to unblind the proposal.
+	providers := make([]builderclient.UnblindedProposalProvider, 0, len(auctionResults.AllProviders))
+	unblindingCandidates := auctionResults.Providers
+	if len(unblindingCandidates) == 0 || s.unblindFromAllRelays {
+		s.log.Trace().Int("providers", len(auctionResults.AllProviders)).Msg("Unblinding from all providers")
+		unblindingCandidates = auctionResults.AllProviders
+	}
+
+	for _, provider := range unblindingCandidates {
+		unblindedProposalProvider, isProvider := provider.(builderclient.UnblindedProposalProvider)
+		if !isProvider {
+			s.log.Warn().Str("provider", provider.Name()).Msg("Auctioneer cannot unblind the proposal")
+			continue
+		}
+		providers = append(providers, unblindedProposalProvider)
+	}
+
+	if len(providers) == 0 {
+		return nil, errors.New("no relays to unblind the block")
+	}
+
+	s.log.Trace().Int("providers", len(providers)).Msg("Obtained relays that can unblind the proposal")
+
+	return providers, nil
+}
+
 // proposeEPBSBlock proposes a Gloas block.
+// skipcq: GO-R1005
 func (s *Service) proposeEPBSBlock(ctx context.Context,
 	duty *beaconblockproposer.Duty,
 	graffiti [32]byte,
@@ -248,7 +261,6 @@ func (s *Service) proposeEPBSBlock(ctx context.Context,
 		return errors.Wrap(err, "failed to obtain ePBS proposal")
 	}
 	proposal := proposalResponse.Data
-	monitorBeaconBlockProposalSource("local")
 	if !proposal.ExecutionPayloadIncluded {
 		return errors.New("ePBS proposal excludes requested execution payload")
 	}
@@ -257,27 +269,9 @@ func (s *Service) proposeEPBSBlock(ctx context.Context,
 		return err
 	}
 
-	envelope, err := proposal.ExecutionPayloadEnvelope()
+	envelope, bodyRoot, err := s.epbsProposalEnvelope(proposal)
 	if err != nil {
-		return errors.Wrap(err, "failed to obtain execution payload envelope")
-	}
-	bodyRoot, err := proposal.BodyRoot()
-	if err != nil {
-		return errors.Wrap(err, "failed to calculate hash tree root of ePBS block body")
-	}
-	block := proposal.GloasContents.Block
-	blockRoot, err := (&phase0.BeaconBlockHeader{
-		Slot:          block.Slot,
-		ProposerIndex: block.ProposerIndex,
-		ParentRoot:    block.ParentRoot,
-		StateRoot:     block.StateRoot,
-		BodyRoot:      bodyRoot,
-	}).HashTreeRoot()
-	if err != nil {
-		return errors.Wrap(err, "failed to calculate hash tree root of ePBS block")
-	}
-	if blockRoot != envelope.BeaconBlockRoot {
-		return errors.New("ePBS execution payload envelope is for incorrect block")
+		return err
 	}
 
 	var signedProposal *api.VersionedSignedProposal
@@ -314,7 +308,7 @@ func (s *Service) proposeEPBSBlock(ctx context.Context,
 		return errors.Wrap(err, "failed to submit proposal")
 	}
 
-	if err := s.executionPayloadEnvelopeSubmitter.SubmitExecutionPayloadEnvelope(ctx, &api.SubmitExecutionPayloadEnvelopeOpts{
+	envelopeSubmissionOpts := &api.SubmitExecutionPayloadEnvelopeOpts{
 		SignedExecutionPayloadEnvelope: &spec.VersionedSignedExecutionPayloadEnvelope{
 			Version: spec.DataVersionGloas,
 			Gloas: &gloas.SignedExecutionPayloadEnvelope{
@@ -324,11 +318,67 @@ func (s *Service) proposeEPBSBlock(ctx context.Context,
 		},
 		KZGProofs: kzgProofs,
 		Blobs:     blobs,
-	}); err != nil {
-		return errors.Wrap(err, "failed to submit execution payload envelope")
 	}
+	var envelopeSubmissionErr error
+	for attempts := 3; attempts > 0; attempts-- {
+		envelopeSubmissionErr = s.executionPayloadEnvelopeSubmitter.SubmitExecutionPayloadEnvelope(ctx, envelopeSubmissionOpts)
+		if envelopeSubmissionErr == nil {
+			break
+		}
+		s.log.Warn().Err(envelopeSubmissionErr).Int("attempts_remaining", attempts-1).Msg("Failed to submit execution payload envelope after block publication")
+		if attempts > 1 {
+			select {
+			case <-ctx.Done():
+				return errors.Wrap(ctx.Err(), "failed to submit execution payload envelope after block publication")
+			case <-time.After(250 * time.Millisecond):
+			}
+		}
+	}
+	if envelopeSubmissionErr != nil {
+		return errors.Wrap(envelopeSubmissionErr, "failed to submit execution payload envelope after block publication")
+	}
+	monitorBeaconBlockProposalSource("local")
 
 	return nil
+}
+
+// epbsProposalEnvelope obtains the execution payload envelope and body root for a proposal,
+// confirming that the envelope is for the proposed block.
+func (*Service) epbsProposalEnvelope(proposal *api.VersionedEPBSProposal) (*gloas.ExecutionPayloadEnvelope, phase0.Root, error) {
+	envelope, err := proposal.ExecutionPayloadEnvelope()
+	if err != nil {
+		return nil, phase0.Root{}, errors.Wrap(err, "failed to obtain execution payload envelope")
+	}
+	if envelope.Payload == nil {
+		return nil, phase0.Root{}, errors.New("ePBS execution payload envelope has no payload")
+	}
+	if proposal.GloasContents == nil || proposal.GloasContents.Block == nil || proposal.GloasContents.Block.Body == nil || proposal.GloasContents.Block.Body.SignedExecutionPayloadBid == nil || proposal.GloasContents.Block.Body.SignedExecutionPayloadBid.Message == nil {
+		return nil, phase0.Root{}, errors.New("ePBS proposal has no execution payload bid")
+	}
+	if proposal.GloasContents.Block.Body.SignedExecutionPayloadBid.Message.BuilderIndex != gloas.BuilderIndex(math.MaxUint64) {
+		return nil, phase0.Root{}, errors.New("ePBS execution payload bid is not self-built")
+	}
+	if envelope.BuilderIndex != proposal.GloasContents.Block.Body.SignedExecutionPayloadBid.Message.BuilderIndex {
+		return nil, phase0.Root{}, errors.New("ePBS execution payload envelope is for incorrect builder index")
+	}
+	bodyRoot, err := proposal.BodyRoot()
+	if err != nil {
+		return nil, phase0.Root{}, errors.Wrap(err, "failed to calculate hash tree root of ePBS block body")
+	}
+	// Use proposal.Root() rather than hashing GloasContents.Block ourselves: the
+	// generated block hasher inlines mainnet preset sizes, so it is wrong on any
+	// other preset.  Root() derives the block root from the same body root that
+	// is signed below, and is the same derivation the beacon node client used to
+	// check the envelope, so this guard and the signature cannot disagree.
+	blockRoot, err := proposal.Root()
+	if err != nil {
+		return nil, phase0.Root{}, errors.Wrap(err, "failed to calculate hash tree root of ePBS block")
+	}
+	if blockRoot != envelope.BeaconBlockRoot {
+		return nil, phase0.Root{}, errors.New("ePBS execution payload envelope is for incorrect block")
+	}
+
+	return envelope, bodyRoot, nil
 }
 
 func (*Service) confirmProposalData(_ context.Context,
