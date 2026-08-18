@@ -28,6 +28,7 @@ import (
 	"github.com/attestantio/vouch/services/chaintime"
 	"github.com/attestantio/vouch/services/metrics"
 	"github.com/attestantio/vouch/services/multiinstance"
+	"github.com/attestantio/vouch/services/payloadattester"
 	"github.com/attestantio/vouch/services/proposalpreparer"
 	"github.com/attestantio/vouch/services/scheduler"
 	"github.com/attestantio/vouch/services/synccommitteeaggregator"
@@ -54,6 +55,8 @@ type parameters struct {
 	proposalsPreparer             proposalpreparer.Service
 	scheduler                     scheduler.Service
 	attester                      attester.Service
+	ptcDutiesProvider             eth2client.PTCDutiesProvider
+	payloadAttester               payloadattester.Service
 	syncCommitteeMessenger        synccommitteemessenger.Service
 	syncCommitteeAggregator       synccommitteeaggregator.Service
 	beaconBlockProposer           beaconblockproposer.Service
@@ -66,6 +69,8 @@ type parameters struct {
 	attestationAggregationDelay   time.Duration
 	maxSyncCommitteeMessageDelay  time.Duration
 	syncCommitteeAggregationDelay time.Duration
+	payloadDueDelay               time.Duration
+	payloadAttestationDelay       time.Duration
 	preGloasTimings               dutyTimings
 	gloasTimings                  dutyTimings
 	verifySyncCommitteeInclusion  bool
@@ -390,6 +395,34 @@ func (p *parameters) slotDuration(ctx context.Context) (map[string]any, time.Dur
 	return specResponse.Data, slotDuration, nil
 }
 
+// WithPTCDutiesProvider sets the payload timeliness committee duties provider.
+func WithPTCDutiesProvider(provider eth2client.PTCDutiesProvider) Parameter {
+	return parameterFunc(func(p *parameters) {
+		p.ptcDutiesProvider = provider
+	})
+}
+
+// WithPayloadAttester sets the payload attester service.
+func WithPayloadAttester(attester payloadattester.Service) Parameter {
+	return parameterFunc(func(p *parameters) {
+		p.payloadAttester = attester
+	})
+}
+
+// WithPayloadAttestationDelay sets the delay before submitting payload attestations.
+func WithPayloadAttestationDelay(delay time.Duration) Parameter {
+	return parameterFunc(func(p *parameters) {
+		p.payloadAttestationDelay = delay
+	})
+}
+
+// WithPayloadDueDelay sets the delay before starting payload attestation work.
+func WithPayloadDueDelay(delay time.Duration) Parameter {
+	return parameterFunc(func(p *parameters) {
+		p.payloadDueDelay = delay
+	})
+}
+
 // dutyTimings holds the duty scheduling deadlines, as offsets in to the slot.
 type dutyTimings struct {
 	maxAttestationDelay           time.Duration
@@ -431,6 +464,39 @@ func (p *parameters) setDefaultDelays(spec map[string]any, slotDuration time.Dur
 	p.preGloasTimings.applyOverrides(overrides)
 	p.gloasTimings = obtainAttestationTimings(spec, slotDuration, true)
 	p.gloasTimings.applyOverrides(overrides)
+
+	payloadDue, payloadAttestationDue := obtainPayloadTimings(spec, slotDuration)
+	if p.payloadDueDelay == 0 {
+		p.payloadDueDelay = payloadDue
+	}
+	if p.payloadAttestationDelay == 0 {
+		p.payloadAttestationDelay = payloadAttestationDue
+	}
+}
+
+// gloasSlotDuration provides the slot duration in effect after Gloas.  Gloas serves this in
+// milliseconds, and it can differ from SECONDS_PER_SLOT, so every Gloas-derived deadline must be a
+// fraction of this value rather than of SECONDS_PER_SLOT.
+func gloasSlotDuration(spec map[string]any, slotDuration time.Duration) time.Duration {
+	if durationMS, ok := spec["SLOT_DURATION_MS"].(uint64); ok && durationMS != 0 {
+		return time.Duration(durationMS) * time.Millisecond
+	}
+
+	return slotDuration
+}
+
+// dueBPS provides the deadline for the given spec value, in basis points of the slot duration,
+// falling back to the supplied default if the value is not served or is out of range.
+func dueBPS(spec map[string]any, name string, slotDuration, fallback time.Duration) time.Duration {
+	bps, ok := spec[name+"_GLOAS"].(uint64)
+	if !ok {
+		bps, ok = spec[name].(uint64)
+	}
+	if !ok || bps == 0 || bps > 10000 {
+		return fallback
+	}
+
+	return slotDuration * time.Duration(bps) / 10000
 }
 
 func obtainAttestationTimings(spec map[string]any, slotDuration time.Duration, gloasActive bool) dutyTimings {
@@ -443,30 +509,21 @@ func obtainAttestationTimings(spec map[string]any, slotDuration time.Duration, g
 		}
 	}
 
-	// Gloas serves the slot duration in milliseconds, and it can differ from SECONDS_PER_SLOT.
-	// All Gloas-derived deadlines must be fractions of this value rather than of SECONDS_PER_SLOT.
-	if durationMS, ok := spec["SLOT_DURATION_MS"].(uint64); ok && durationMS != 0 {
-		slotDuration = time.Duration(durationMS) * time.Millisecond
-	}
-
-	// dueBPS provides the deadline for the given spec value, in basis points of the slot duration,
-	// falling back to the supplied default if the value is not served or is out of range.
-	dueBPS := func(name string, fallback time.Duration) time.Duration {
-		bps, ok := spec[name+"_GLOAS"].(uint64)
-		if !ok {
-			bps, ok = spec[name].(uint64)
-		}
-		if !ok || bps == 0 || bps > 10000 {
-			return fallback
-		}
-
-		return slotDuration * time.Duration(bps) / 10000
-	}
+	slotDuration = gloasSlotDuration(spec, slotDuration)
 
 	return dutyTimings{
-		maxAttestationDelay:           dueBPS("ATTESTATION_DUE_BPS", slotDuration/3),
-		attestationAggregationDelay:   dueBPS("AGGREGATE_DUE_BPS", slotDuration*2/3),
-		maxSyncCommitteeMessageDelay:  dueBPS("SYNC_MESSAGE_DUE_BPS", slotDuration/3),
-		syncCommitteeAggregationDelay: dueBPS("CONTRIBUTION_DUE_BPS", slotDuration*2/3),
+		maxAttestationDelay:           dueBPS(spec, "ATTESTATION_DUE_BPS", slotDuration, slotDuration/3),
+		attestationAggregationDelay:   dueBPS(spec, "AGGREGATE_DUE_BPS", slotDuration, slotDuration*2/3),
+		maxSyncCommitteeMessageDelay:  dueBPS(spec, "SYNC_MESSAGE_DUE_BPS", slotDuration, slotDuration/3),
+		syncCommitteeAggregationDelay: dueBPS(spec, "CONTRIBUTION_DUE_BPS", slotDuration, slotDuration*2/3),
 	}
+}
+
+// obtainPayloadTimings provides the payload and payload attestation deadlines.  Both duties exist
+// only after Gloas, so both always follow the Gloas slot duration.
+func obtainPayloadTimings(spec map[string]any, slotDuration time.Duration) (time.Duration, time.Duration) {
+	slotDuration = gloasSlotDuration(spec, slotDuration)
+
+	return dueBPS(spec, "PAYLOAD_DUE_BPS", slotDuration, slotDuration/2),
+		dueBPS(spec, "PAYLOAD_ATTESTATION_DUE_BPS", slotDuration, slotDuration*3/4)
 }
