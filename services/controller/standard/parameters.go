@@ -392,19 +392,54 @@ func parseAndCheckParameters(ctx context.Context, params ...Parameter) (*paramet
 		return nil, errors.New("SECONDS_PER_SLOT of unexpected type")
 	}
 	// maxProposalDelay can be 0, so no check for it here.
+	gloasActive := parameters.chainTimeService.CurrentEpoch() >= parameters.chainTimeService.HardForkEpoch(ctx, "GLOAS_FORK_EPOCH")
+	attestationDue, aggregationDue, syncMessageDue, contributionDue := obtainAttestationTimings(spec, slotDuration, gloasActive)
 	if parameters.maxAttestationDelay == 0 {
-		parameters.maxAttestationDelay = slotDuration / 3
+		parameters.maxAttestationDelay = attestationDue
 	}
 	if parameters.attestationAggregationDelay == 0 {
-		parameters.attestationAggregationDelay = slotDuration * 2 / 3
+		parameters.attestationAggregationDelay = aggregationDue
 	}
 	if parameters.maxSyncCommitteeMessageDelay == 0 {
-		parameters.maxSyncCommitteeMessageDelay = slotDuration / 3
+		parameters.maxSyncCommitteeMessageDelay = syncMessageDue
 	}
 	if parameters.syncCommitteeAggregationDelay == 0 {
-		parameters.syncCommitteeAggregationDelay = slotDuration * 2 / 3
+		parameters.syncCommitteeAggregationDelay = contributionDue
 	}
 	// Sync committee duties provider/messenger/aggregator/subscriber are optional so no checks here.
 
 	return &parameters, nil
+}
+
+func obtainAttestationTimings(spec map[string]any, slotDuration time.Duration, gloasActive bool) (time.Duration, time.Duration, time.Duration, time.Duration) {
+	attestationDue := slotDuration / 3
+	aggregationDue := slotDuration * 2 / 3
+	syncMessageDue := slotDuration / 3
+	contributionDue := slotDuration * 2 / 3
+	if !gloasActive {
+		return attestationDue, aggregationDue, syncMessageDue, contributionDue
+	}
+	if durationMS, ok := spec["SLOT_DURATION_MS"].(uint64); ok {
+		slotDuration = time.Duration(durationMS) * time.Millisecond
+	}
+	dueBPS := func(name string) (uint64, bool) {
+		if bps, ok := spec[name+"_GLOAS"].(uint64); ok {
+			return bps, true
+		}
+		bps, ok := spec[name].(uint64)
+		return bps, ok
+	}
+	if bps, ok := dueBPS("ATTESTATION_DUE_BPS"); ok {
+		attestationDue = slotDuration * time.Duration(bps) / 10000
+	}
+	if bps, ok := dueBPS("AGGREGATE_DUE_BPS"); ok {
+		aggregationDue = slotDuration * time.Duration(bps) / 10000
+	}
+	if bps, ok := dueBPS("SYNC_MESSAGE_DUE_BPS"); ok {
+		syncMessageDue = slotDuration * time.Duration(bps) / 10000
+	}
+	if bps, ok := dueBPS("CONTRIBUTION_DUE_BPS"); ok {
+		contributionDue = slotDuration * time.Duration(bps) / 10000
+	}
+	return attestationDue, aggregationDue, syncMessageDue, contributionDue
 }
