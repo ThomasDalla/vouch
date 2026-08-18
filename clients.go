@@ -33,6 +33,41 @@ var (
 	knownClientsMu sync.Mutex
 )
 
+var (
+	reconnectCallbacks   []func(ctx context.Context, address string)
+	reconnectCallbacksMu sync.RWMutex
+)
+
+// addReconnectCallback adds a function that is called whenever a consensus client becomes
+// active, either on first connection or on reconnection after the client has been
+// unavailable.  Callbacks are called synchronously, from a goroutine owned by the client.
+func addReconnectCallback(callback func(ctx context.Context, address string)) {
+	reconnectCallbacksMu.Lock()
+	defer reconnectCallbacksMu.Unlock()
+
+	reconnectCallbacks = append(reconnectCallbacks, callback)
+}
+
+// onClientActive calls the registered reconnect callbacks for the client at the given address.
+func onClientActive(ctx context.Context, address string) {
+	reconnectCallbacksMu.RLock()
+	callbacks := make([]func(context.Context, string), len(reconnectCallbacks))
+	copy(callbacks, reconnectCallbacks)
+	reconnectCallbacksMu.RUnlock()
+
+	for _, callback := range callbacks {
+		callback(ctx, address)
+	}
+}
+
+// clientHooks are the hooks provided to each consensus client, allowing vouch to react to
+// changes in the client's connection state.
+var clientHooks = &httpclient.Hooks{
+	OnActive: func(ctx context.Context, s *httpclient.Service) {
+		onClientActive(ctx, s.Address())
+	},
+}
+
 // fetchClient fetches a client service, instantiating it if required.
 func fetchClient(ctx context.Context, monitor metrics.Service, address string) (eth2client.Service, error) {
 	if address == "" {
@@ -55,6 +90,7 @@ func fetchClient(ctx context.Context, monitor metrics.Service, address string) (
 				"User-Agent": fmt.Sprintf("Vouch/%s", ReleaseVersion),
 			}),
 			httpclient.WithReducedMemoryUsage(util.HierarchicalBool("reduced-memory-usage", fmt.Sprintf("eth2client.%s", address))),
+			httpclient.WithHooks(clientHooks),
 		)
 		if err != nil {
 			return nil, errors.Wrap(err, "failed to initiate consensus client")

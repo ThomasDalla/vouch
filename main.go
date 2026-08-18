@@ -401,6 +401,19 @@ func startServices(ctx context.Context,
 	if err != nil {
 		return nil, nil, err
 	}
+	// Beacon nodes hold proposal preparations in memory, so a node that has restarted has lost them
+	// until the next scheduled update.  Update the preparations as soon as a node becomes available
+	// to keep that window as short as possible.
+	// proposalPreparer is nil if the chain is not yet bellatrix-capable, in which case there are no
+	// preparations to provide.
+	if proposalPreparer != nil {
+		addReconnectCallback(func(ctx context.Context, address string) {
+			log.Debug().Str("address", address).Msg("Consensus client active; updating proposal preparations")
+			if err := proposalPreparer.UpdatePreparations(ctx); err != nil {
+				log.Error().Str("address", address).Err(err).Msg("Failed to update proposal preparations on client activation")
+			}
+		})
+	}
 
 	multiInstance, err := startMultiInstance(ctx, monitor, chainTime, eth2Client, beaconBlockHeaderProvider)
 	if err != nil {
