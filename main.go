@@ -116,7 +116,7 @@ import (
 )
 
 // ReleaseVersion is the release version for the code.
-var ReleaseVersion = "1.13.1+reconnect-prepare.3+reg-timeout.1"
+var ReleaseVersion = "1.13.1+reconnect-prepare.3+reg-timeout.1+prewarm.1"
 
 func main() {
 	exitCode := main2()
