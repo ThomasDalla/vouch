@@ -1,0 +1,87 @@
+version: "2"
+run:
+  modules-download-mode: readonly
+  tests: false
+  allow-parallel-runners: true
+linters:
+  default: all
+  disable:
+    - cyclop
+    - depguard
+    - dupl
+    - err113
+    - exhaustruct
+    - funlen
+    - gochecknoglobals
+    - gocognit
+    - ireturn
+    - lll
+    - mnd
+    - perfsprint
+    - varnamelen
+    - wsl
+    - maintidx
+    - noinlineerr
+  settings:
+    lll:
+      line-length: 132
+    nlreturn:
+      block-size: 3
+    staticcheck:
+      checks:
+        - all
+        - -ST1000
+    tagliatelle:
+      case:
+        rules:
+          json: snake
+          yaml: snake
+    wsl_v5:
+      disable:
+        - assign
+        - branch
+        - decl
+        - defer
+        - expr
+        - for
+        - go
+        - if
+        - inc-dec
+        - label
+        - range
+        - return
+        - select
+        - send
+        - switch
+        - type-switch
+        - append
+        - assign-exclusive
+        - assign-expr
+        - err
+        - leading-whitespace
+        - trailing-whitespace
+  exclusions:
+    generated: lax
+    presets:
+      - comments
+      - common-false-positives
+      - legacy
+      - std-error-handling
+    paths:
+      - .*_ssz\.go$
+      - third_party$
+      - builtin$
+      - examples$
+formatters:
+  enable:
+    - gci
+    - gofmt
+    - gofumpt
+    - goimports
+  exclusions:
+    generated: lax
+    paths:
+      - .*_ssz\.go$
+      - third_party$
+      - builtin$
+      - examples$

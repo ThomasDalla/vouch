@@ -142,3 +142,5 @@ require (
 	gopkg.in/yaml.v2 v2.4.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
+
+replace github.com/wealdtech/go-eth2-wallet-dirk => ./third_party/go-eth2-wallet-dirk
