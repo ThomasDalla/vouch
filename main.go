@@ -401,6 +401,7 @@ func startServices(ctx context.Context,
 	if err != nil {
 		return nil, nil, err
 	}
+	startProposalPreparationsUpdater(ctx, chainTime, proposalPreparer)
 
 	multiInstance, err := startMultiInstance(ctx, monitor, chainTime, eth2Client, beaconBlockHeaderProvider)
 	if err != nil {
