@@ -18,6 +18,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/attestantio/go-eth2-client/spec/phase0"
 	"github.com/attestantio/vouch/services/chaintime"
 	"github.com/attestantio/vouch/services/proposalpreparer"
 )
@@ -37,6 +38,8 @@ import (
 type proposalPreparationsUpdater struct {
 	chainTime chaintime.Service
 	preparer  proposalpreparer.Service
+	// bellatrixForkEpoch is read once at startup, as the controller does.
+	bellatrixForkEpoch phase0.Epoch
 
 	// running is true from the first trigger until a cooldown ends with nothing pending.
 	running bool
@@ -52,13 +55,18 @@ type proposalPreparationsUpdater struct {
 //
 // The supplied context is used for the updates.  The context passed to a client's hooks can be
 // that of the request that triggered the connection state check, which may already be cancelled.
+//
+// The bellatrix fork epoch is read once here rather than on each update: a node that has just
+// become synced again has to fetch the spec afresh, and a failed lookup would skip the update.
+// If the lookup fails here the updater never updates, as with the controller's per-epoch update.
 func startProposalPreparationsUpdater(ctx context.Context,
 	chainTime chaintime.Service,
 	preparer proposalpreparer.Service,
 ) {
 	updater := &proposalPreparationsUpdater{
-		chainTime: chainTime,
-		preparer:  preparer,
+		chainTime:          chainTime,
+		preparer:           preparer,
+		bellatrixForkEpoch: chainTime.HardForkEpoch(ctx, "BELLATRIX_FORK_EPOCH"),
 	}
 	setClientSyncedHandler(func(address string) {
 		updater.triggerUpdate(ctx, address)
@@ -78,7 +86,7 @@ func (u *proposalPreparationsUpdater) triggerUpdate(ctx context.Context, address
 		u.pendingAddress = address
 		u.mu.Unlock()
 		log.Debug().
-			Str("beacon_node", address).
+			Str("beacon_node_address", address).
 			Msg("Consensus client synced; proposal preparations updated recently, so updating again after the cooldown")
 
 		return
@@ -130,17 +138,18 @@ func (u *proposalPreparationsUpdater) updatePreparations(ctx context.Context, ad
 	}
 
 	// As with the scheduled update, there is nothing to prepare before the bellatrix fork.  An
-	// unscheduled fork returns the far future epoch, so is also skipped.
-	if u.chainTime.CurrentEpoch() < u.chainTime.HardForkEpoch(ctx, "BELLATRIX_FORK_EPOCH") {
+	// unscheduled fork, or one that could not be read at startup, is the far future epoch, so is
+	// also skipped.
+	if u.chainTime.CurrentEpoch() < u.bellatrixForkEpoch {
 		log.Trace().Msg("Not at bellatrix fork epoch; not updating proposal preparations")
 
 		return
 	}
 
 	name := address
-	log.Info().Str("beacon_node", name).Msg("Consensus client synced; updating proposal preparations")
+	log.Info().Str("beacon_node_address", name).Msg("Consensus client synced; updating proposal preparations")
 	if err := u.preparer.UpdatePreparations(ctx); err != nil {
-		log.Error().Str("beacon_node", name).Err(err).Msg("Failed to update proposal preparations after consensus client synced")
+		log.Error().Str("beacon_node_address", name).Err(err).Msg("Failed to update proposal preparations after consensus client synced")
 	}
 }
 
